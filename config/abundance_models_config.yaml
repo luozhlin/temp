@@ -1,0 +1,36 @@
+# basic config
+baseconfig: 'configs/base.json'
+dataroot: 'data'  # 数据路径
+resume_state: 'checkpoints/diffusion/I190000_E97_gen.pth'  # 模型路径
+
+model:
+  in_channel: 3
+  out_channel: 3
+  inner_channel: 128
+  channel_multiplier: [1, 2, 4, 8, 8]
+  attn_res: [16]
+  res_blocks: 2
+  dropout: 0.2
+
+# hyperparameters
+eta1: 80 #    args.eta1 *= 256*64  args.eta2 *= 8*64
+eta2: 2
+k: 8
+step: 20  # 采样步数
+
+# 
+# task: "denoise"
+# task_params: 50
+
+# settings
+diffusion_steps: 1000
+beta_schedule: 'linear'
+beta_linear_start: 1e-6
+beta_linear_end: 1e-2
+cosine_s: 8e-3
+no_rrqr: False
+
+gpu_ids: "1"
+batch_size: 1
+sample_num: 1
+save_dir: 'results'
