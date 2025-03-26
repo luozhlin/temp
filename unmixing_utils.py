@@ -7,14 +7,36 @@ from pysptools.abundance_maps.amaps import NNLS
 
 _H_cache = None
 
+def cal_loss(W, H, Y, bar_alpha, alpha, var, t, mask, type="denoise", __cache_H=False):
+    # H
+    B, R, Hh, Ww = H.shape
+    H = (H + 1)/2  # (1, R, H, W)
+    H = H.permute(1,0,2,3).reshape(R, -1)  # (R, N)
+    # W
+    W = W[:, 0]  # (R, 1, L) ->  (R, L)
+    W = (W + 1)/2 
+    # Y (L,N)
+    
+    weight = 0.0001
+    loss1 = th.norm(weight * (Y - W.T@H), p=2) ** 2 
+    return loss1
+
 def cal_gradient(W, H, Y, bar_alpha, alpha, var, t, mask, type="denoise", __cache_H=False):
-    H = (H + 1)/2
+    device = W.device if W.is_cuda else th.device("cpu")
+    # W
     W = W[:, 0]  # (R, 1 , L) ->  (R, L)
     W = (W + 1)/2
+    # H 
+    H = (H + 1)/2
     B, R, Hh, Ww = H.shape
+    H = H[0,:,:,:]
     H = H.reshape(R, -1)  # (R, N)
     H = H.T  # (N, R)
+    # Y
     Y = Y.T  # (L, N) -> (N, L)
+    # device
+    H = H.to(device)
+    Y = Y.to(device)
 
     global _H_cache
 
@@ -29,22 +51,33 @@ def cal_gradient(W, H, Y, bar_alpha, alpha, var, t, mask, type="denoise", __cach
         delta_W = (A.T @ B).trace()/ ((B.T @ B).trace()+1e-5)
         delta_W = delta_W * np.sqrt(bar_alpha)/2
 
-        ## ED loss
-        # eta1 = 1/2
-        # grad_ed = eta1 *2 * (W - th.mean(W, dim=0, keepdim=True))
-
-
+        Rr, Ll = W.shape
+        mu = W.mean(dim=0) 
+        grad_ed = 2.0 * (Rr - 1) / Rr * (W - mu) /Ll # 向量化计算梯度
         # 对H的梯度
         grad_H = (H @ W - Y) @ W.T  # 4096,3
         C = grad_H @ W  # 4096,224 
         delta_H = (A.T @ C).trace() / ((C.T @ C).trace() + 1e-5)
         delta_H = delta_H * np.sqrt(bar_alpha) / 2
-        #delta_H = th.tensor(1)
+
+        row_sums = th.sum(H, axis=1, keepdims=True)
+        grad_asc = 2 * (row_sums - 1)
+
+        # grad_one = th.zeros_like(H)
+        # mask = H <= 0
+        # grad_one[mask] = 2 * H[mask]
+
     else:
         raise NotImplementedError
-    assert not th.isnan(delta_W),th.isnan(delta_H)
-    grad_W = grad_W[:, None] * delta_W  #- grad_ed[:, None]
-    grad_H = grad_H[:, None] * delta_H
+    # assert not th.isnan(delta_W),th.isnan(delta_H)
+
+    # print("ED", grad_ed)
+    # print("ASC",0 grad_asc)
+
+    grad_W = grad_W[:, None] * delta_W #+ (-0.1)*grad_ed[:, None] 
+    grad_H = grad_H[:, None] * delta_H + (-0.1)*grad_asc[:, None] 
+
+
     grad_H = grad_H.permute(1,2,0).reshape(1, R, Hh, Ww)
 
     log = {'res': th.norm(A).item(), "H": H.cpu().numpy(), "W": W.cpu().numpy()}
@@ -53,16 +86,21 @@ def cal_gradient(W, H, Y, bar_alpha, alpha, var, t, mask, type="denoise", __cach
 
 
 def cal_conditional_gradient_W(W, Y, bar_alpha, alpha, var, t, mask, type="dps", __cache_H=False):
+    device = W.device if W.is_cuda else th.device("cpu")
     W = W[:, 0]
     W = (W + 1)/2
+
     if mask is None:
         W_masked = W
         Y_masked = Y
     else:
         W_masked = W[:, ~mask]
         Y_masked = Y
+    Y_masked = Y_masked.to(device)
+    W_masked = W_masked.to(device)
 
     H = solve_H(Y_masked, W_masked, t, __cache_H=__cache_H)
+    H = H.to(device)
     N, R = H.shape
     if type == "dmps":
         grad = H.T @ th.inverse(var*th.eye(N, device=H.device)+(1-bar_alpha)/bar_alpha * H@H.T)/np.sqrt(bar_alpha) @ (Y - H@W) * (1-alpha)/np.sqrt(alpha)/2
@@ -86,9 +124,12 @@ def cal_conditional_gradient_W(W, Y, bar_alpha, alpha, var, t, mask, type="dps",
 
 def solve_H(Y, W, t, __cache_H=True):
     global _H_cache
+
+
     R = W.shape[0]
     if t % 5 == 0 or _H_cache is None or __cache_H is False:
-        H = FCLS(Y, W) #.cpu.numpy
+        H = FCLS(Y, W) 
+
         _H_cache = H
     else:
         H = _H_cache
@@ -164,9 +205,9 @@ class UnmixingUtils:
         pass
 
     def hyperSAD(self, A_est):
-        Rt = self.A.shape[1]
-        Re = A_est.shape[1]
-        P = np.zeros([Rt, Re])
+        Rt = self.A.shape[1]  # 3
+        Re = A_est.shape[1]  # 3
+        P = np.zeros([Rt, Re])  # (3,3) matrix
         for i in range(Rt):
             d = np.arccos(np.clip(A_est.T @ self.A[:, i] / np.linalg.norm(A_est, axis=0)/np.linalg.norm(self.A[:, i]), -1, 1))
             P[i, np.argmin(d)] = 1
@@ -175,17 +216,16 @@ class UnmixingUtils:
         dist = np.zeros(Rt)
         for i in range(Rt):
             dist[i] = np.arccos(np.clip(Ap.T[i] @ self.A[:, i] / np.linalg.norm(Ap.T[i], axis=0)/np.linalg.norm(self.A[:, i]), -1, 1))
-
         mean_dist = np.mean(np.sort(dist)[:A_est.shape[1]])
         return dist, mean_dist, P
 
     def hyperRMSE(self, S_est, P):
         # print(P) (6,3)
         N = np.size(self.S, 0)
-        print("N", N)
         Sp = S_est.T @ P.T
         # Sp = Sp / np.sum(Sp, axis=1, keepdims=True)
         rmse = self.S - Sp
+
         rmse = rmse * rmse
         rmse = (np.sqrt(np.sum(rmse, 0) / N))
         # print(rmse)
@@ -220,9 +260,9 @@ def estimate_snr(Y, r_m, x):
     [L, N] = Y.shape  # L number of bands (channels), N number of pixels
     [p, N] = x.shape  # p number of endmembers (reduced dimension)
 
-    P_y = sp.sum(Y ** 2) / float(N)
-    P_x = sp.sum(x ** 2) / float(N) + sp.sum(r_m ** 2)
-    snr_est = 10 * sp.log10((P_x - p / L * P_y) / (P_y - P_x))
+    P_y = np.sum(Y ** 2) / float(N)
+    P_x = np.sum(x ** 2) / float(N) + np.sum(r_m ** 2)
+    snr_est = 10 * np.log10((P_x - p / L * P_y) / (P_y - P_x))
 
     return snr_est
 
@@ -280,10 +320,10 @@ def vca(Y, R, verbose=True, snr_input=0):
     #############################################
 
     if snr_input == 0:
-        y_m = sp.mean(Y, axis=1, keepdims=True)
+        y_m = np.mean(Y, axis=1, keepdims=True)
         Y_o = Y - y_m  # data with zero-mean
-        Ud = splin.svd(sp.dot(Y_o, Y_o.T) / float(N))[0][:, :R]  # computes the R-projection matrix
-        x_p = sp.dot(Ud.T, Y_o)  # project the zero-mean data onto p-subspace
+        Ud = splin.svd(np.dot(Y_o, Y_o.T) / float(N))[0][:, :R]  # computes the R-projection matrix
+        x_p = np.dot(Ud.T, Y_o)  # project the zero-mean data onto p-subspace
 
         SNR = estimate_snr(Y, y_m, x_p);
 
@@ -294,7 +334,7 @@ def vca(Y, R, verbose=True, snr_input=0):
         # if verbose:
         #     print("input SNR = {}[dB]\n".format(SNR))
 
-    SNR_th = 15 + 10 * sp.log10(R)
+    SNR_th = 15 + 10 * np.log10(R)
 
     #############################################
     # Choosing Projective Projection or
@@ -309,30 +349,30 @@ def vca(Y, R, verbose=True, snr_input=0):
             if snr_input == 0:  # it means that the projection is already computed
                 Ud = Ud[:, :d]
             else:
-                y_m = sp.mean(Y, axis=1, keepdims=True)
+                y_m = np.mean(Y, axis=1, keepdims=True)
                 Y_o = Y - y_m  # data with zero-mean
 
-                Ud = splin.svd(sp.dot(Y_o, Y_o.T) / float(N))[0][:, :d]  # computes the p-projection matrix
-                x_p = sp.dot(Ud.T, Y_o)  # project thezeros mean data onto p-subspace
+                Ud = splin.svd(np.dot(Y_o, Y_o.T) / float(N))[0][:, :d]  # computes the p-projection matrix
+                x_p = np.dot(Ud.T, Y_o)  # project thezeros mean data onto p-subspace
 
-            Yp = sp.dot(Ud, x_p[:d, :]) + y_m  # again in dimension L
+            Yp = np.dot(Ud, x_p[:d, :]) + y_m  # again in dimension L
 
             x = x_p[:d, :]  # x_p =  Ud.T * Y_o is on a R-dim subspace
-            c = sp.amax(sp.sum(x ** 2, axis=0)) ** 0.5
-            y = sp.vstack((x, c * sp.ones((1, N))))
+            c = np.amax(np.sum(x ** 2, axis=0)) ** 0.5
+            y = np.vstack((x, c * np.ones((1, N))))
     else:
         # if verbose:
         #     print("... Select the projective proj.")
 
         d = R
-        Ud = splin.svd(sp.dot(Y, Y.T) / float(N))[0][:, :d]  # computes the p-projection matrix
+        Ud = splin.svd(np.dot(Y, Y.T) / float(N))[0][:, :d]  # computes the p-projection matrix
 
-        x_p = sp.dot(Ud.T, Y)
-        Yp = sp.dot(Ud, x_p[:d, :])  # again in dimension L (note that x_p has no null mean)
+        x_p = np.dot(Ud.T, Y)
+        Yp = np.dot(Ud, x_p[:d, :])  # again in dimension L (note that x_p has no null mean)
 
-        x = sp.dot(Ud.T, Y)
-        u = sp.mean(x, axis=1, keepdims=True)  # equivalent to  u = Ud.T * r_m
-        y = x / sp.dot(u.T, x)
+        x = np.dot(Ud.T, Y)
+        u = np.mean(x, axis=1, keepdims=True)  # equivalent to  u = Ud.T * r_m
+        y = x / np.dot(u.T, x)
 
     #############################################
     # VCA algorithm
@@ -340,18 +380,18 @@ def vca(Y, R, verbose=True, snr_input=0):
 
 
 
-    indice = sp.zeros((R), dtype=int)
-    A = sp.zeros((R, R))
+    indice = np.zeros((R), dtype=int)
+    A = np.zeros((R, R))
     A[-1, 0] = 1
 
     for i in range(R):
         w = np.random.rand(R, 1);
-        f = w - sp.dot(A, sp.dot(splin.pinv(A), w))
+        f = w - np.dot(A, np.dot(splin.pinv(A), w))
         f = f / splin.norm(f)
 
-        v = sp.dot(f.T, y)
+        v = np.dot(f.T, y)
 
-        indice[i] = sp.argmax(sp.absolute(v))
+        indice[i] = np.argmax(np.absolute(v))
         A[:, i] = y[:, indice[i]]  # same as x(:,indice(i))
 
     Ae = Yp[:, indice]
